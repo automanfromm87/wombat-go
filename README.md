@@ -357,20 +357,148 @@ identically.
 
 ## Over HTTP
 
-`httpapi/` is the same agent behind Server-Sent Events, for a UI:
+`httpapi/` is the same agent behind Server-Sent Events. `cmd/wombat-serve`
+mounts it with a single-file browser client at `/`:
 
 ```
-POST /v1/sessions              → {"id": …}
-POST /v1/sessions/{id}/turns   → start a turn
-GET  /v1/sessions/{id}/events  → SSE, honours Last-Event-ID
-POST /v1/approvals/{id}        → answer a permission prompt
+cp .env.example .env
+go build -o bin/ ./cmd/...
+set -a; . ./.env; set +a
+bin/wombat-serve -addr :8080 -working-dir /tmp/work -permission workspace
 ```
 
-Sequence numbers are **session-global, not per turn**, so a UI that reconnects
-across a turn boundary resumes at the event it dropped instead of at the start
-of the current turn. `cmd/wombat-serve` wires it up with a single-file browser
-client, and `cmd/wombat-tsgen` reflects over the event registry to generate
-`web/events.ts`, so the TypeScript types cannot drift from the Go ones.
+Everything below is JSON in and JSON out, and every field name is real —
+`cmd/wombat-tsgen` reflects over the Go event registry to generate
+`web/events.ts`, so a TypeScript client cannot drift from the server.
+
+### Endpoints
+
+| | |
+|---|---|
+| `GET /api/health` | `{"status":"ok","version":"3881238e","uptime_sec":12.3}` |
+| `GET /api/config` | what this server can do — see below |
+| `POST /api/sessions` | create a session **and run its first turn** |
+| `GET /api/sessions` | list |
+| `GET /api/sessions/{id}` | one session's state |
+| `DELETE /api/sessions/{id}` | cancel an in-flight turn and drop it |
+| `POST /api/sessions/{id}/messages` | send the next turn |
+| `GET /api/sessions/{id}/messages` | the transcript, as `[]llm.Message` |
+| `GET /api/sessions/{id}/events` | **SSE**, honours `Last-Event-ID` |
+| `GET /api/sessions/{id}/approvals` | what is waiting on a human |
+| `POST /api/sessions/{id}/approvals/{use_id}` | `{"allow":true}` → 204 |
+| `GET /metrics` | Prometheus text (unless `-metrics=false`) |
+
+Creating a session and running its first turn is **one call**, not two: a
+session with no turn in it is a state with no use, and a client that crashed
+between the two calls would leave a paid-for slot occupied by nothing.
+
+```jsonc
+// POST /api/sessions
+{
+  "prompt": "what does this repo do?",     // required
+  "model": "…",                            // optional, overrides the server default
+  "permission": "off|readonly|workspace|ask",  // may only be STRICTER than the server's
+  "workspace": "subdir",                   // must resolve inside -working-dir
+  "max_iters": 20,                         // may only be LOWER than the server's cap
+  "title": "…"
+}
+// 201 Created, Location: /api/sessions/{id}
+{
+  "id": "8a6f9a81f18c00d5", "title": "", "state": "running", "turns": 1,
+  "events": 1, "created": "…", "updated": "…", "options": {…},
+  "spend": {"cost_usd":0,"input_tokens":0,"output_tokens":0,
+            "cache_read_tokens":0,"calls":0,"elapsed_sec":0}
+}
+```
+
+`state` is one of `idle`, `running`, `waiting` (the model called a pause tool
+and wants an answer), `approving` (a tool call is parked on a human),
+`done`, `error`.
+
+### The event stream
+
+```
+GET /api/sessions/{id}/events
+Last-Event-ID: 42          # optional; replay resumes at 43
+```
+
+```
+id: 3
+event: reasoning_delta
+data: {"type":"reasoning_delta","text":"need the calculator"}
+
+id: 11
+event: tool_done
+data: {"type":"tool_done","use_id":"call_01…","name":"calculator","ok":true,"output":"42","ms":0}
+
+id: 12
+event: turn_ended
+data: {"type":"turn_ended","turn":1,"state":"idle","outcome":"answer",
+       "answer":"6 × 7 equals 42.","spend":{…}}
+```
+
+The `id:` is **session-global, not per turn.** That is the whole reason a UI
+can reconnect: a per-turn counter would resume a client that dropped during
+turn 3 at the start of turn 4, silently losing everything it missed.
+
+Event `type`s, all generated into `web/events.ts`: `turn_started`,
+`iter_start`, `llm_start`, `reasoning_delta`, `text_delta`,
+`tool_args_delta`, `tool_start`, `tool_done`, `permission_requested`,
+`permission_decided`, `subagent_start`, `subagent_event`, `subagent_end`,
+`spend`, `llm_done`, `turn_ended`. A `: ping` comment keeps the connection
+open through an idle proxy.
+
+Render `text_delta` **and** `reasoning_delta`. On a reasoning model the
+scratchpad is most of the generated tokens, so a UI that only renders the
+answer looks frozen for minutes.
+
+### Approvals
+
+Under `-permission workspace`, exec and anything outside the working directory
+stop for a person. The turn does not fail — it parks, `state` becomes
+`approving`, and a `permission_requested` event names the call:
+
+```jsonc
+{"type":"permission_requested","use_id":"call_01…","tool":"bash",
+ "input":{"command":"rm -rf build","exec_dir":"/tmp/work"},
+ "reason":"bash is an exec tool, which this policy always confirms with a person"}
+```
+
+```
+POST /api/sessions/{id}/approvals/call_01…
+{"allow": false}          → 204 No Content
+```
+
+`allow` is a required tri-state: omitting it is a 400 rather than a silent
+deny, because "the client forgot the field" and "the human said no" must not
+look the same.
+
+### Errors
+
+Always `{"error":{"kind":"…","message":"…"}}`, with `kind` from a closed set a
+client can switch on: `bad_request`, `body_too_large`, `not_found`,
+`no_such_session`, `no_such_approval`, `busy` (a turn is already running),
+`done`, `already_answered`, `too_many_sessions`, `closed`, `internal`.
+Never a bare string — a front end that has to pattern-match on prose breaks
+the first time a message is reworded.
+
+### Trying it
+
+```bash
+SID=$(curl -s -X POST localhost:8080/api/sessions -H 'content-type: application/json' \
+  -d '{"prompt":"What is 6*7? Use the calculator, then answer in one sentence."}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+curl -N localhost:8080/api/sessions/$SID/events    # watch it work
+
+curl -s -X POST localhost:8080/api/sessions/$SID/messages \
+  -H 'content-type: application/json' -d '{"prompt":"and times three?"}'
+```
+
+`-cors` is empty by default, which is right when the bundled UI is served from
+this same origin. There is **no authentication**: `-cors '*'` lets any page the
+operator visits drive this agent with the operator's network access and file
+system. Put it behind something before it leaves localhost.
 
 ## What is kept
 
